@@ -1,0 +1,73 @@
+// === src/main.rs ===
+use std::{fs, path::PathBuf};
+use anyhow::Result;
+use clap::Parser;
+use gltf::Gltf;
+use image::{imageops, DynamicImage};
+use ktx2::writer::{Writer, WriteKTX2Options};
+
+#[derive(Parser)]
+#[command(author, version, about="Convert glTF textures to KTX2 and generate lightmaps", long_about = None)]
+struct Args {
+    /// Input glTF file (.gltf or .glb)
+    #[arg(long)]
+    input: PathBuf,
+    /// Output directory for textures and lightmaps
+    #[arg(long)]
+    output_dir: PathBuf,
+    /// Lightmap size (width & height in px)
+    #[arg(long, default_value_t = 512)]
+    lightmap_size: u32,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    fs::create_dir_all(&args.output_dir)?;
+
+    // Load glTF
+    let (doc, buffers, images) = Gltf::open(&args.input)?;
+    let base = args.input.parent().unwrap_or_else(|| PathBuf::from(".").as_path());
+
+    for (i, img) in doc.images().enumerate() {
+        // Load image data
+        let dyn_img: DynamicImage = match img.source() {
+            gltf::image::Source::Uri { uri, .. } => {
+                let path = base.join(uri);
+                image::open(path)?
+            }
+            gltf::image::Source::View { view, .. } => {
+                let buffer = &buffers[view.buffer().index()].0;
+                let slice = &buffer[view.offset()..view.offset() + view.length()];
+                image::load_from_memory(slice)?
+            }
+        };
+
+        // Generate lightmap (grayscale resized)
+        let lm = dyn_img.resize_exact(
+            args.lightmap_size,
+            args.lightmap_size,
+            imageops::FilterType::Lanczos3,
+        ).grayscale();
+        let lm_path = args.output_dir.join(format!("lightmap_{}.png", i));
+        lm.save(lm_path)?;
+
+        // Encode to KTX2
+        let img_rgba = dyn_img.to_rgba8();
+        let mut opts = WriteKTX2Options::default();
+        opts.generate_mipmaps = true;
+        let mut writer = Writer::new(opts);
+        let encoded = writer.encode(
+            &img_rgba,
+            dyn_img.width(),
+            dyn_img.height(),
+        )?;
+        let ktx_path = args.output_dir.join(format!("texture_{}.ktx2", i));
+        tokio::fs::write(ktx_path, encoded).await?;
+
+        println!("Processed texture {}", i);
+    }
+
+    println!("All textures converted and lightmaps generated.");
+    Ok(())
+}
